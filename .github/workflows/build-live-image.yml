@@ -26,6 +26,12 @@ jobs:
       - name: Set image name
         run: echo "IMAGE_NAME=fwts-live-${{ inputs.version }}-x86_64.img.xz" >> $GITHUB_ENV
 
+      - name: Build gadget prime (snapcraft on runner)
+        run: |
+          sudo snap install snapcraft --classic
+          cd pc-amd64-gadget
+          snapcraft prime --destructive-mode
+
       - name: Build Docker image
         run: docker build -t fwts-live .
 
