@@ -1,2 +1,3 @@
 # SHA256 checksums for fwts-live images
 # Format: <sha256>  <filename>
+9115251422e2aaf9645b536e7c922c009d78993de844e24a5e56f5213146e29b  fwts-live-26.03.00-x86_64.img.xz
