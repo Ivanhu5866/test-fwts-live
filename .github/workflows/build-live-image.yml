@@ -51,9 +51,9 @@ jobs:
         run: |
           git config user.name "${{ inputs.git_name }}"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin master
           git add SHA256SUM.txt
           git commit -s -m "${{ inputs.version }}-x86_64"
+          git pull --rebase origin master
           git push origin master
 
       - name: Create or update GitHub Release
