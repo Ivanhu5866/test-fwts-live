@@ -1,0 +1,29 @@
+#!/bin/bash -ex
+# vi: ts=4 expandtab
+#
+# Generate the root directory/manifest for rootfs.tar.xz and squashfs
+
+if [ -n "$SUBARCH" ]; then
+    echo "Skipping rootfs build for subarch flavor build"
+    exit 0
+fi
+
+. config/functions
+
+rootfs_dir=rootfs.dir
+mkdir $rootfs_dir
+cp -a chroot/* $rootfs_dir
+
+setup_mountpoint $rootfs_dir
+
+env DEBIAN_FRONTEND=noninteractive chroot $rootfs_dir apt-get --purge remove --assume-yes '^linux-.*' 'linux-base+'
+env DEBIAN_FRONTEND=noninteractive chroot $rootfs_dir apt-get --purge remove --assume-yes '^grub-.*'
+env DEBIAN_FRONTEND=noninteractive chroot $rootfs_dir apt-get autoremove --purge --assume-yes
+rm -rf $rootfs_dir/boot/grub
+
+# Keep this as some derivatives mount a tempfs here
+mkdir -p $rootfs_dir/lib/modules
+
+create_manifest $rootfs_dir "livecd.ubuntu-cpc.rootfs.manifest" "livecd.ubuntu-cpc.rootfs.spdx"  "cloud-image-rootfs-$ARCH-$(date +%Y%m%dT%H:%M:%S)"
+
+teardown_mountpoint $rootfs_dir

@@ -1,0 +1,19 @@
+#!/bin/bash -ex
+rootd="${1:-/}"
+
+. /root/config/chroot
+
+_xchroot() {
+   # Prevent multiple chroots
+   if [ "$1" = "/" ]; then
+      shift;
+      "$@"
+   else
+      chroot "$@"
+   fi
+}
+
+_xchroot "${rootd}" apt -y install imagemagick-6.q16 fonts-ubuntu fonts-ubuntu-console-
+_xchroot "${rootd}" /usr/bin/convert /etc/splash.png -gravity center -font Ubuntu -pointsize 20 -fill white -annotate +0+50 "$(fwts -v | cut -d, -f2)" /tmp/splash-new.png && mv /tmp/splash-new.png /etc/splash.png
+_xchroot "${rootd}" apt -y remove imagemagick-6.q16 fonts-ubuntu
+_xchroot "${rootd}" apt -y autoremove

@@ -1,0 +1,14 @@
+#!/bin/bash -ex
+# vi: ts=4 expandtab
+#
+# Generate the rootfs.tar.xz and manifest
+
+if [ -n "$SUBARCH" ]; then
+    echo "Skipping rootfs build for subarch flavor build"
+    exit 0
+fi
+
+# This is the directory created by create-root-dir.binary
+rootfs_dir=rootfs.dir
+
+(cd $rootfs_dir/ && tar -c --sort=name --xattrs *) | xz > livecd.ubuntu-cpc.rootfs.tar.xz

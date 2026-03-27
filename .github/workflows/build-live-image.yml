@@ -1,0 +1,64 @@
+name: Build fwts-live Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 26.03.00)'
+        required: true
+      git_name:
+        description: 'Git author name for release commit'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image name
+        run: echo "IMAGE_NAME=fwts-live-${{ inputs.version }}-x86_64.img.xz" >> $GITHUB_ENV
+
+      - name: Build Docker image
+        run: docker build -t fwts-live .
+
+      - name: Run build (produces pc.img.xz)
+        run: docker run --privileged --rm -v "$GITHUB_WORKSPACE:/image" fwts-live
+
+      - name: Verify output
+        run: test -f pc.img.xz || (echo "Build failed: pc.img.xz not found" && exit 1)
+
+      - name: Rename output
+        run: mv pc.img.xz "${{ env.IMAGE_NAME }}"
+
+      - name: Update SHA256SUM.txt
+        run: sha256sum "${{ env.IMAGE_NAME }}" >> SHA256SUM.txt
+
+      - name: Commit and push SHA256SUM.txt
+        run: |
+          git config user.name "${{ inputs.git_name }}"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin master
+          git add SHA256SUM.txt
+          git commit -s -m "${{ inputs.version }}-x86_64"
+          git push origin master
+
+      - name: Create or update GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "V${{ inputs.version }}" > /dev/null 2>&1; then
+            gh release upload "V${{ inputs.version }}" "${{ env.IMAGE_NAME }}"
+          else
+            gh release create "V${{ inputs.version }}" \
+              --title "fwts-live V${{ inputs.version }}" \
+              --notes "fwts-live image V${{ inputs.version }} (x86_64)" \
+              "${{ env.IMAGE_NAME }}"
+          fi

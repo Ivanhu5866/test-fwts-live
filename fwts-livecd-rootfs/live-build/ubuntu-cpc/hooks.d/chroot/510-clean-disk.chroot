@@ -1,0 +1,22 @@
+#!/bin/bash -ex
+rootd="${1:-/}"
+
+. /root/config/chroot
+
+_xchroot() {
+   # Prevent multiple chroots
+   if [ "$1" = "/" ]; then
+      shift;
+      "$@"
+   else
+      chroot "$@"
+   fi
+}
+
+_xchroot "${rootd}" apt -y purge g++ build-essential libc6-dev \
+ linux-libc-dev dirmngr fakeroot isc-dhcp-client isc-dhcp-common \
+ logrotate manpages rsyslog
+_xchroot "${rootd}" apt -y autoremove
+_xchroot "${rootd}" rm -rf /var/lib/apt/lists/*
+# FIXME: Stop doing this when fwts-efi-runtime-dkms is no longer a strict dependency
+rm -rf /usr/src/*

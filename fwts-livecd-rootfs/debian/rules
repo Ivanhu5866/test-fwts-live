@@ -1,0 +1,18 @@
+#! /usr/bin/make -f
+%:
+	dh $@
+
+DEB_HOST_MULTIARCH := $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+
+override_dh_auto_test:
+	dh_auto_test
+	set -e; for x in live-build/auto/*; do \
+		sh -n "$$x"; \
+	done
+
+override_dh_install:
+	dh_install
+	find debian/livecd-rootfs -type f -print0 | \
+		xargs -0r grep -lZ '@DEB_HOST_MULTIARCH@' | \
+		xargs -0r \
+			sed -i 's/@DEB_HOST_MULTIARCH@/$(DEB_HOST_MULTIARCH)/g'

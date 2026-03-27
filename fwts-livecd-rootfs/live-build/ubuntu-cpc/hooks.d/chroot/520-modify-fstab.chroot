@@ -1,0 +1,7 @@
+#!/bin/bash -ex
+rootd="${1:-/}"
+
+cat << EOF >> "${rootd}/etc/fstab"
+LABEL=writable          /               ext4    defaults        0 0
+LABEL=fwts-result       /fwts           vfat    defaults        0 0
+EOF

@@ -1,0 +1,5 @@
+depends root-dir
+base/wsl.binary
+provides livecd.ubuntu-cpc.wsl.rootfs.tar.gz
+provides livecd.ubuntu-cpc.wsl.rootfs.manifest
+provides livecd.ubuntu-cpc.wsl.rootfs.filelist

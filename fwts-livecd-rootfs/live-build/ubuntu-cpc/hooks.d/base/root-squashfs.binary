@@ -1,0 +1,25 @@
+#!/bin/bash -ex
+# vi: ts=4 noexpandtab
+#
+# Generate a squashfs root and manifest
+
+if [ -n "$SUBARCH" ]; then
+	echo "Skipping rootfs build for subarch flavor build"
+	exit 0
+fi
+
+. config/functions
+
+# This is the directory created by create-root-dir.binary
+rootfs_dir=rootfs.dir
+
+squashfs_f="$PWD/livecd.ubuntu-cpc.squashfs"
+
+cp livecd.ubuntu-cpc.rootfs.manifest ${squashfs_f}.manifest
+cp livecd.ubuntu-cpc.rootfs.filelist ${squashfs_f}.filelist
+cp livecd.ubuntu-cpc.rootfs.spdx ${squashfs_f}.spdx
+
+# fstab is omitted from the squashfs
+grep -v '^/etc/fstab$' livecd.ubuntu-cpc.rootfs.filelist >$squashfs_f.filelist
+
+create_squashfs $rootfs_dir $squashfs_f

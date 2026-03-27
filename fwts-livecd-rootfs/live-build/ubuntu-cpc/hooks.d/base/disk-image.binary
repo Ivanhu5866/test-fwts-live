@@ -1,0 +1,192 @@
+#!/bin/bash -ex
+
+IMAGE_STR="# CLOUD_IMG: This file was created/modified by the Cloud Image build process"
+FS_LABEL="cloudimg-rootfs"
+
+. config/binary
+
+. config/functions
+
+BOOTPART_START=
+BOOTPART_END=
+BOOT_MOUNTPOINT=
+ROOTPART_START=1
+
+my_d=$(dirname $(readlink -f ${0}))
+
+case $ARCH:$SUBARCH in
+	ppc64el:*|powerpc:*)
+		echo "POWER disk images are handled separately"
+		exit 0
+		;;
+	armhf:raspi2)
+		# matches the size of the snappy image
+		IMAGE_SIZE=$((4*1000*1000*1000))
+
+		BOOTPART_START=8192s
+		BOOTPART_END=138M
+		BOOT_MOUNTPOINT=/boot/firmware
+		;;
+	arm64:*|armhf:*|riscv64:*)
+		echo "We only create EFI images for $ARCH."
+		exit 0
+		;;
+        amd64:generic)
+		echo "We only create EFI images for $SUBARCH."
+		exit 0
+		;;
+	*)
+		;;
+esac
+
+create_empty_partition_table() {
+    parted "$1" --script -- mklabel msdos
+}
+
+create_empty_partition() {
+    local disk="$1"
+    local part="$2"
+    local start="$3"
+    local end="$4"
+    local type="$5"
+    local bootable="$6"
+
+    parted_prefix="parted $disk --script --"
+    ${parted_prefix} mkpart primary "$type" "$start" "$end"
+    if [ -n "$bootable" ]; then
+        ${parted_prefix} set "$part" boot
+    fi
+    ${parted_prefix} print
+    ${parted_prefix} align-check opt "$part"
+}
+
+disk_image=binary/boot/disk.ext4
+
+create_empty_disk_image "${disk_image}"
+create_empty_partition_table "${disk_image}"
+
+ROOTPART=1
+ROOT_BOOTABLE=1
+if [ -n "$BOOTPART_START" ]; then
+	ROOTPART=2
+	ROOTPART_START="$BOOTPART_END"
+	ROOT_BOOTABLE=
+	create_empty_partition "$disk_image" 1 "$BOOTPART_START" "$BOOTPART_END" fat32 1
+fi
+create_empty_partition "${disk_image}" "$ROOTPART" "$ROOTPART_START" -1 ext2 "$ROOT_BOOTABLE"
+
+mount_image "${disk_image}" "$ROOTPART"
+
+# Copy the chroot in to the disk
+make_ext4_partition "${rootfs_dev_mapper}"
+mkdir mountpoint
+mount "${rootfs_dev_mapper}" mountpoint
+
+if [ -n "$BOOT_MOUNTPOINT" ]; then
+	boot_dev_mapper="${rootfs_dev_mapper%%[0-9]}1"
+	# assume fat32 for now
+	mkfs.vfat -n system-boot "$boot_dev_mapper"
+	mkdir -p "mountpoint/$BOOT_MOUNTPOINT"
+	mount "$boot_dev_mapper" "mountpoint/$BOOT_MOUNTPOINT"
+fi
+
+cp -a chroot/* mountpoint/
+
+setup_mountpoint mountpoint
+
+case $ARCH:$SUBARCH in
+	armhf:raspi2)
+		chroot mountpoint flash-kernel \
+			--machine "Raspberry Pi 2 Model B"
+		# not the best place for this, but neither flash-kernel nor
+		# u-boot have provisions for installing u-boot via maintainer
+		# script
+		${my_d}/raspi2/mkknlimg --dtok \
+			mountpoint/usr/lib/u-boot/rpi_2/u-boot.bin \
+			mountpoint/boot/firmware/uboot.bin
+		;;
+	*)	;;
+esac
+
+case $ARCH in
+    amd64|i386) should_install_grub=1;;
+             *) should_install_grub=0;;
+esac
+
+if [ "${should_install_grub}" -eq 1 ]; then
+    echo "(hd0) ${loop_device}" > mountpoint/tmp/device.map
+    chroot mountpoint grub-install ${loop_device}
+    chroot mountpoint grub-bios-setup \
+        --boot-image=i386-pc/boot.img \
+        --core-image=i386-pc/core.img \
+        --skip-fs-probe \
+        --device-map=/tmp/device.map \
+        ${loop_device}
+
+    divert_grub mountpoint
+    track_initramfs_boot_fallback mountpoint
+    chroot mountpoint update-grub
+    undivert_grub mountpoint
+
+    rm mountpoint/tmp/device.map
+fi
+
+# Use the linux-kvm kernel for minimal images where available
+# linux-kvm currently only exists for amd64
+if [ "${SUBPROJECT:-}" = "minimized" ] && [ "$ARCH" = "amd64" ]; then
+    replace_kernel mountpoint linux-kvm
+fi
+
+if [ "$ARCH" = "s390x" ]; then
+    # Do ZIPL install bits
+    chroot mountpoint apt-get -qqy install s390-tools sysconfig-hardware
+    chroot mountpoint apt-get autoremove --purge --assume-yes
+
+    # Write out cloudy zipl.conf for future kernel updates
+    cat << EOF > mountpoint/etc/zipl.conf
+# This has been modified by the cloud image build process
+[defaultboot]
+default=ubuntu
+
+[ubuntu]
+target = /boot
+image = /boot/vmlinuz
+parameters = root=LABEL=cloudimg-rootfs
+EOF
+
+    ZIPL_EXTRA_PARAMS=
+    if [ -e mountpoint/boot/initrd.img-* ]; then
+        # Kernel initramfs hooks end up creating a copy
+        # rather than a symlink FIXME
+        pushd mountpoint/boot
+        ln -sf initrd.img-* initrd.img
+        popd
+
+        echo "ramdisk = /boot/initrd.img" >> mountpoint/etc/zipl.conf
+
+        ZIPL_EXTRA_PARAMS=--ramdisk=/boot/initrd.img
+    fi
+
+    # Create bootmap file
+    chroot mountpoint /sbin/zipl -V \
+        --image=/boot/vmlinuz \
+        --parameters='root=LABEL=cloudimg-rootfs' \
+        --target=/boot/ \
+        --targetbase=$loop_device \
+        --targettype=SCSI \
+        --targetblocksize=512 \
+        --targetoffset=2048 \
+        $ZIPL_EXTRA_PARAMS
+fi
+
+create_manifest  "mountpoint/" "$PWD/livecd.ubuntu-cpc.disk-image.manifest" "$PWD/livecd.ubuntu-cpc.disk-image.spdx"  "cloud-image-$ARCH-$(date +%Y%m%dT%H:%M:%S)"
+
+if [ -n "$BOOT_MOUNTPOINT" ]; then
+	umount "mountpoint/$BOOT_MOUNTPOINT"
+fi
+
+umount_partition mountpoint
+rmdir mountpoint
+
+clean_loops
+trap - EXIT

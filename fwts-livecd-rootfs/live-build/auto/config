@@ -1,0 +1,1544 @@
+#! /bin/sh
+set -e
+
+rm -rf config
+
+echo "Building on $(hostname --fqdn)"
+
+SEEDMIRROR=http://people.canonical.com/~ubuntu-archive/seeds/
+if [ -z "$MIRROR" ]; then
+	case $(hostname --fqdn) in
+		*.ubuntu.com)		MIRROR=http://ftpmaster.internal/ubuntu/
+					SEEDMIRROR=http://archive-team.internal/seeds/
+					;;
+		*.buildd)		MIRROR=http://ftpmaster.internal/ubuntu/
+					SEEDMIRROR=http://archive-team.internal/seeds/
+					;;
+		*.ppa|*.scalingstack)	MIRROR=http://ftpmaster.internal/ubuntu/
+					SEEDMIRROR=http://archive-team.internal/seeds/
+					;;
+		*)	case $ARCH in
+				i386|amd64)	MIRROR=http://archive.ubuntu.com/ubuntu/ ;;
+				*)		MIRROR=http://ports.ubuntu.com/ubuntu-ports/ ;;
+			esac
+			;;
+	esac
+fi
+
+mkdir -p config
+cp -af /usr/share/livecd-rootfs/live-build/functions config/functions
+cp -af /usr/share/livecd-rootfs/live-build/lb_*_layered config/
+cp -af /usr/share/livecd-rootfs/live-build/snap-seed-parse.py config/snap-seed-parse
+cp -af /usr/share/livecd-rootfs/live-build/squashfs-exclude-files config/
+
+mkdir -p config/package-lists
+
+. config/functions
+
+OPTS=
+COMPONENTS=
+BINARY_REMOVE_LINUX=:
+BINARY_IMAGES=none
+MEMTEST=none
+SOURCE='--source false'
+BOOTLOADER=none
+BOOTAPPEND_LIVE=
+LIVE_TASK=
+PREINSTALLED=false
+PREINSTALL_POOL=
+PREINSTALL_POOL_SEEDS=
+PREFIX="livecd.$PROJECT${SUBARCH:+-$SUBARCH}"
+
+CHROOT_HOOKS=
+BINARY_HOOKS=
+
+APT_OPTIONS=" --yes -oDebug::pkgDepCache::AutoInstall=yes "
+
+PASSES_TO_LAYERS=false
+_PASSES_TO_LAYERS=		# Stores the initial value of PASSES_TO_LAYERS
+PASSES=
+
+_check_immutable_passes_to_layers () {
+	# Check that PASSES_TO_LAYERS didn't change ie we didn't switch from layer
+	# to non-layer image format and vice versa.
+	if [ -z "$_PASSES_TO_LAYERS" ]; then
+		_PASSES_TO_LAYERS=$PASSES_TO_LAYERS
+	fi
+
+	if [ "$_PASSES_TO_LAYERS" != "$PASSES_TO_LAYERS" ]; then
+		echo "ERROR: PASSES_TO_LAYERS has changed from $_PASSES_TO_LAYERS to $PASSES_TO_LAYERS between 2 API calls. Please set it first."
+		exit 1
+	fi
+}
+
+_check_layers_only_API () {
+	# Check if a function is designed only for layered mode
+	# $1 name of the function
+	if [ "$PASSES_TO_LAYERS" != "true" ]; then
+		echo "$1 should only be used in layered mode, with PASSES_TO_LAYERS set to true"
+		exit 1
+	fi
+}
+
+_register_pass () {
+	# In layer mode, record a pass into the list of passes
+	# $1 Name of the pass
+	[ "$PASSES_TO_LAYERS" != "true" ] && return
+
+	PASSES="$PASSES $1"
+}
+
+add_task ()
+{
+	local pass="$1"
+	shift
+	local task
+	local snap_list_file
+	local snap_list_files
+	local curseed
+
+	_check_immutable_passes_to_layers
+	_register_pass "$pass"
+
+	# The removal of direct task installation support from live-build
+	# poses some problems.  If the chroot has multiarch configured - for
+	# example, if we're building for amd64 - then dumpavail will show
+	# foreign-architecture packages which will have their own Task
+	# lines, but which we don't want to install.  (Compare
+	# PackageContainerInterface::FromTask in apt, which restricts task
+	# expansion to the native architecture.)  We therefore restrict our
+	# search to stanzas with Architecture: $ARCH or all.
+	#
+	# However, even this may not be accurate enough.  At the moment I
+	# have no idea what happens if an Architecture: all package has
+	# different Task fields on different architectures.  This is
+	# probably a lurking timebomb that we need to fix.  In the meantime,
+	# the Architecture restriction at least saves us from abject
+	# failure.
+	#
+	# We want as well to grab the snap list for each PASS. Resolve for all
+	# given task, and deduplicate them to generate snaps for the PASS.
+
+	for task; do
+		# We need a ridiculous number of backslashes to protect
+		# parentheses from eval.
+		echo "!chroot chroot apt-cache dumpavail | grep-dctrl -nsPackage \\\\\\( -XFArchitecture $ARCH -o -XFArchitecture all \\\\\\) -a -wFTask $task" >> "config/package-lists/livecd-rootfs.list.chroot_$pass"
+
+		curseed=$(seed_from_task ${task})
+		if [ -z "${curseed}" ]; then
+			echo "W: No seed matching task ${task}"
+			continue
+		fi
+		snap_list_file="config/package-lists/seed.${curseed}.snaplist.full"
+		snap_from_seed "${curseed}" $snap_list_file
+		if [ -e "$snap_list_file" ]; then
+			snap_list_files="${snap_list_files} $snap_list_file"
+		fi
+	done
+	# The snap list is one line, and could be duplicated between seeds via inheritance.
+	# Uniquely sort them and store them back in one line.
+	if [ -n "${snap_list_files}" ]; then
+		cat ${snap_list_files}|xargs -n1|sort -u > "config/package-lists/livecd-rootfs.snaplist.chroot_${pass}.full"
+		rm ${snap_list_files}
+	fi
+}
+
+add_package ()
+{
+	# Adds a pass named pass_name composed of packages to install
+	# $1 pass
+	# $@ list of packages
+
+	local pass="$1"
+	shift
+	local pkg
+
+	_check_immutable_passes_to_layers
+	_register_pass "$pass"
+
+	for pkg; do
+		echo "$pkg" >> "config/package-lists/livecd-rootfs.list.chroot_$pass"
+	done
+}
+
+remove_package ()
+{
+	# Adds a pass named pass_name composed of packages to remove
+	# $1 pass
+	# $@ list of packages
+
+	local pass="$1"
+	shift
+	local pkg
+
+	_check_immutable_passes_to_layers
+	_check_layers_only_API "remove_package"
+	_register_pass "$pass"
+
+	for pkg; do
+		echo "$pkg" >> "config/package-lists/livecd-rootfs.removal-list.chroot_$pass"
+	done
+}
+
+add_snap ()
+{
+	# Adds a pass named pass_name composed of snaps to install
+	# $1 pass
+	# $@ list of snaps
+
+	local pass="$1"
+	shift
+	local pkg
+
+	_check_immutable_passes_to_layers
+	_register_pass "$pass"
+
+	for pkg; do
+		echo "$pkg" >> "config/package-lists/livecd-rootfs.snaplist.chroot_$pass.full"
+	done
+}
+
+get_seeded_languages () {
+	# We assume any seed name of the form ${no_lang_seed}-${foo} where
+	# ${foo} is only two or three characters long is a default language
+	# seed.
+	langs=''
+	for no_lang_seed in "$@"; do
+		seed_regex="${no_lang_seed}"'-[^-.]{2,3}$'
+		for seed in $(ls config/germinate-output | grep -E "${seed_regex}"); do
+			lang=$(echo "${seed}" | grep -oE '[^-.]{2,3}$')
+			langs="$langs $lang"
+		done
+	done
+	echo $langs | tr ' ' '\n' | sort -u | tr '\n' ' '
+}
+
+derive_language_layers () {
+	# create special layers for each default language
+	#
+	# $1 base pass
+	# $2 base seed (without any languages)
+	# $3 default language seed
+	# $4 space separated list of default languages
+	# e.g.:
+	#    derive_language_layers minimal desktop-minimal desktop-minimal-default-languages
+	#    derive_language_layers minimal.standard desktop desktop-default-languages
+	#
+	# The way this works is perhaps a little counterintuitive.
+	#
+	# The first goal here is that the installed system should contain
+	# language support for the language the user selected.  One way to do
+	# this using layers would be to have a layer that contained no
+	# language support and a derived layer for each (default) language. So
+	# something like:
+	#
+	#    filesystem.squashfs    (contains no language support)
+	#    filesystem.en.squashfs (contains English language support)
+	#    filesystem.fr.squashfs (contains French language support)
+	#    ...
+	#
+	# Then if the user selects French as their language, we just copy
+	# filesystem.fr.squashfs to the target system.
+	#
+	# But we want the live session to support these languages too and
+	# simply adding all the language support to the live layer would mean
+	# we'd have the each language's support files on the ISO twice (once
+	# in filesystem.$LANG.squashfs and once in filesystem.live.squashfs).
+	#
+	# So what is done instead is that we add support for all the default
+	# languages to the base layer and then create derived layers that
+	# _remove_ support for all languages but the desired language and
+	# because file removals are cheap to represent in overlays, this all
+	# ends up taking way less space, and filesystem.live.squashfs gets
+	# support for all languages from the base layer.  We also create a
+	# layer than has support for all languages removed, which can be used
+	# for the base of an install for a non-default language.
+	local pass base_pass=$1 no_lang_seed=$2 def_lang_seed=$3 langs=$4
+	_check_immutable_passes_to_layers
+	_check_layers_only_API "derive_language_layers"
+
+	for lang in $langs; do
+		pass="${base_pass}.${lang}"
+		_register_pass ${pass}
+		# Remove packages from the default language seed that are not
+		# in the language specific seed from the language specific layer.
+		# I find this expression helps a little to make this make sense:
+		#  ((base) + (en fr de)) - (  (en fr de)   - (fr)) ==        (base + fr)
+		# `layer will all langs'   `def_lang_seed'  `lang'    `what we want to install'
+		subtract_package_lists ${def_lang_seed} ${no_lang_seed}-${lang} >> config/package-lists/livecd-rootfs.removal-list.chroot_$pass
+	done
+
+	no_lang_pass=$base_pass.no-languages
+	_register_pass ${no_lang_pass}
+	# Remove all packages from the default language seed that are not in
+	# the no_lang_seed from the no-languages layer.
+	subtract_package_lists ${def_lang_seed} ${no_lang_seed} >> config/package-lists/livecd-rootfs.removal-list.chroot_${no_lang_pass}
+}
+
+add_chroot_hook ()
+{
+	CHROOT_HOOKS="${CHROOT_HOOKS:+$CHROOT_HOOKS }$1"
+}
+
+add_binary_hook ()
+{
+	BINARY_HOOKS="${BINARY_HOOKS:+$BINARY_HOOKS }$1"
+}
+
+_sanitize_passes ()
+{
+	# Returns an uniquely ordered list of passes and ensure dependency tree is coherent
+	# $1 list of passes
+	local passes="$1"
+	[ -z "$passes" ] && return
+
+	passes=$(echo $passes | tr ' ' '\n' | sort -u)
+	for pass in $passes; do
+		parent=$(get_parent_pass $pass)
+		# if root pass, no parent to find
+		[ -z "$parent" ] && continue
+		if [ $(echo "$passes"|grep -cE "^$parent\$") -ne 1 ]; then
+			echo "ERROR: '$parent' is required by '$pass' but is missing. Registered passes are:\n$passes"
+			exit 1
+		fi
+	done
+
+	# return the list of passes
+	echo $passes
+}
+
+_get_live_passes ()
+{
+	# Returns a list of all passes that ends with .live for automated live passes detection
+	# $1 list of passes
+	local passes="$1"
+	local livepasses=""
+	[ -z "$passes" ] && return
+
+	for pass in $passes; do
+		if echo $pass | grep -Eq '\.live$'; then
+			livepasses="$pass $livepasses"
+		fi
+	done
+	echo $livepasses
+}
+
+if [ -z "${IMAGEFORMAT:-}" ]; then
+	case $PROJECT:${SUBPROJECT:-} in
+		ubuntu-cpc:*|ubuntu:desktop-preinstalled|ubuntu-wsl:*)
+			case $SUBARCH in
+				raspi|intel-iot)
+					IMAGEFORMAT=ubuntu-image
+					;;
+				*)
+					IMAGEFORMAT=ext4
+					;;
+			esac
+			;;
+		ubuntu-server:live)
+			IMAGEFORMAT=plain
+			;;
+	esac
+fi
+
+# Configure preinstalled ubuntu-cpc images with included password
+# one also must request disk1-img-xz image format
+if [ "$IMAGEFORMAT" = "ext4" ] && [ "$PROJECT" = "ubuntu-cpc" ]; then
+	case $ARCH:$SUBARCH in
+		armhf:raspi2|riscv64:sifive_*|riscv64:nezha|riscv64:visionfive|riscv64:licheerv|riscv64:icicle|*:generic)
+			IMAGE_HAS_HARDCODED_PASSWORD=1
+			if [ -z "${IMAGE_TARGETS:-}" ]; then
+				export IMAGE_TARGETS="disk1-img-xz"
+			fi
+			;;
+	esac
+fi
+
+skip_lb_stage() {
+	STAGE="$1"
+	mkdir -p .build
+	touch ".build/$STAGE"
+}
+
+case $IMAGEFORMAT in
+	ext2|ext3|ext4)
+		OPTS="${OPTS:+$OPTS }--initramfs none --chroot-filesystem $IMAGEFORMAT"
+		PREINSTALLED=true
+		;;
+	plain)
+		case $PROJECT:${SUBPROJECT:-} in
+			ubuntu-server:live)
+	                        touch config/universe-enabled
+				;;
+			*)
+				PREINSTALLED=true
+				;;
+		esac
+		OPTS="${OPTS:+$OPTS }--initramfs none --chroot-filesystem $IMAGEFORMAT"
+		;;
+
+	ubuntu-image)
+		UBUNTU_IMAGE_ARGS=""
+		case "$ARCH+${SUBARCH:-}" in
+			amd64+intel-iot)
+				MODEL=intel-iot ;;
+			amd64+*)
+				MODEL=pc-amd64 ;;
+			i386+*)
+				MODEL=pc-i386 ;;
+			arm64+snapdragon)
+				MODEL=dragonboard ;;
+			armhf+raspi)
+				MODEL=pi ;;
+			armhf+raspi2)
+				MODEL=pi2 ;;
+			armhf+raspi3)
+				MODEL=pi3 ;;
+			arm64+raspi)
+				MODEL=pi-arm64 ;;
+			arm64+raspi3)
+				MODEL=pi3-arm64 ;;
+			armhf+cm3)
+				MODEL=cm3 ;;
+			arm64+tegra)
+				MODEL=tegra ;;
+			arm64+tegra-igx)
+				MODEL=tegra-igx ;;
+			arm64+tegra-jetson)
+				MODEL=tegra-jetson ;;
+			arm64+*)
+				MODEL=pc-arm64 ;;
+			*)
+				echo "Model $ARCH+${SUBARCH:-} unknown to livecd-rootfs" >&2
+				exit 1
+				;;
+		esac
+
+		# If we have a datestamp coming from cdimage, use that to populate
+		# .disk/info on the target image
+		if [ -n "$NOW" ]; then
+			echo "$NOW" > config/disk-info
+			UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS --disk-info config/disk-info"
+		fi
+
+		if [ $PROJECT = "ubuntu-core" ]; then
+			# snap-based core images
+
+			CHANNEL="${CHANNEL:-edge}"
+			case $MODEL in
+				pc-amd64|pc-i386|pc-arm64)
+					if [ -z "${SUBARCH:-}" ]; then
+						# This is to make sure there's enough writable space
+						UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS --image-size 3700M"
+					fi
+					;;
+				*) ;;
+			esac
+			case $SUITE in
+				xenial)
+					# Ubuntu Core 16
+					UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS -c $CHANNEL"
+					;;
+				bionic)
+					# Ubuntu Core 18
+					MODEL="ubuntu-core-18-${MODEL#pc-}"
+					UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS -c $CHANNEL"
+					;;
+				*)
+					if [ "$SUITE" = "focal" ]; then
+						CORE_MAJOR=20
+					else
+						CORE_MAJOR=22
+					fi
+					if [ "${MODEL}" = "pi" ]; then
+						MODEL=pi-armhf
+					fi
+					# Ubuntu Core 2x
+					# Currently uc2x assertions do not support global
+					# channel overrides, instead we have per-channel models
+					case $CHANNEL in
+						stable)
+							MODEL="ubuntu-core-${CORE_MAJOR}-${MODEL#pc-}"
+							;;
+						candidate|beta|edge|dangerous)
+							MODEL="ubuntu-core-${CORE_MAJOR}-${MODEL#pc-}-${CHANNEL}"
+							;;
+						dangerous-*)
+							# That being said, the dangerous grade *does*
+							# support channel overrides, so we can use the
+							# dangerous model assertion and override the channel
+							# freely.
+							MODEL="ubuntu-core-${CORE_MAJOR}-${MODEL#pc-}-dangerous"
+							CHANNEL=${CHANNEL#dangerous-}
+							UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS -c $CHANNEL"
+							;;
+						*)
+							echo "Unknown CHANNEL ${CHANNEL} specification for ${SUITE}"
+							exit 1
+							;;
+					esac
+					;;
+			esac
+
+			case "$ARCH+${SUBARCH:-}" in
+				amd64+kassel)
+					EXTRA_SNAPS="$EXTRA_SNAPS core bluez alsa-utils"
+					;;
+				*) ;;
+			esac
+			for snap in $EXTRA_SNAPS; do
+				UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS --extra-snaps $snap"
+			done
+			echo "IMAGEFORMAT=$IMAGEFORMAT" >> config/common
+			echo "UBUNTU_IMAGE_ARGS=\"$UBUNTU_IMAGE_ARGS\"" >> config/common
+			# Store model assertion in top dir to get it picked up later as a build artifact
+			env SNAPPY_STORE_NO_CDN=1 snap known --remote model series=16 model="$MODEL" brand-id=canonical > "$PREFIX".model-assertion
+			echo "Configured ubuntu-image for the following model assertion:"
+			cat "$PREFIX".model-assertion
+			echo "----------------------------------------------------------"
+		else
+			# classic images
+
+			# Certain models have different names but are built from the same source gadget tree
+			BRANCH="classic"
+			case $MODEL in
+				pi|pi-arm64|pi3-arm64)
+					MODEL=pi
+					BRANCH="classic-22.04"
+					;;
+				intel-iot)
+					MODEL=pc
+					;;
+			esac
+
+			GADGET_TARGET="server"
+			if [ "$SUBPROJECT" = "desktop-preinstalled" ]; then
+				GADGET_TARGET="desktop"
+			fi
+
+			UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS${SUBPROJECT:+ --subproject \"$SUBPROJECT\"}"
+			UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS${PROPOSED:+ --with-proposed}"
+			UBUNTU_IMAGE_ARGS="$UBUNTU_IMAGE_ARGS${EXTRA_PPAS:+ --extra-ppas \"$EXTRA_PPAS\"}"
+
+			# We need to look in two places for the gadget tree:
+			# - Launchpad hosted gadgets will be in the snap-gadget repo
+			# - Github hosted gadgets are mirrored into a github-mirror repo
+			git clone git://git.launchpad.net/~canonical-foundations/snap-$MODEL/+git/snap-$MODEL -b $BRANCH config/$PREFIX-gadget || git clone git://git.launchpad.net/~canonical-foundations/snap-$MODEL/+git/github-mirror -b $BRANCH config/$PREFIX-gadget || git clone git://git.launchpad.net/~canonical-foundations/snap-$MODEL/+git/github-mirror-$ARCH -b $BRANCH config/$PREFIX-gadget
+
+			echo "IMAGEFORMAT=$IMAGEFORMAT" >> config/common
+			echo "SUITE=$SUITE" >> config/common
+			echo "GADGET_TARGET=$GADGET_TARGET" >> config/common
+			echo "UBUNTU_IMAGE_ARGS=\"$UBUNTU_IMAGE_ARGS\"" >> config/common
+
+			echo "Configured ubuntu-image for the following gadget model: $MODEL"
+		fi
+
+		# Save the model name used for building, mostly for any model-specific hook execution
+		echo "MODEL=$MODEL" >> config/common
+		# Fake finished configuration for lb build
+		mkdir -p .build
+		touch .build/config
+		exit 0
+		;;
+
+	none)
+		# Currently the IMAGEFORMAT none format is used only for ubuntu-image
+		# targeted image builds which, currently, only target physical devices.
+		OPTS="${OPTS:+$OPTS }--chroot-filesystem $IMAGEFORMAT"
+		PREINSTALLED=true
+		;;
+	*)
+		case $PROJECT in
+			ubuntu-server)
+				;;
+			ubuntu-wsl)
+				;;
+			ubuntu)
+				if [ "$SUBPROJECT" != "canary" ]; then
+					add_package live casper
+				fi
+				;;
+			*)
+				add_package live casper
+				;;
+		esac
+		;;
+esac
+
+if [ "$PREINSTALLED" = "true" ]; then
+	# Touch a random file that we can refer back to during build,
+	# cause that's wildly hackish
+	touch config/universe-enabled
+	case $PROJECT in
+		kubuntu*)
+			add_package live oem-config-kde ubiquity-frontend-kde
+			add_package live ubiquity-slideshow-kubuntu
+			;;
+		lubuntu*)
+			add_package live oem-config-gtk ubiquity-frontend-gtk
+			add_package live ubiquity-slideshow-lubuntu
+			;;
+		xubuntu*)
+			add_package live oem-config-gtk ubiquity-frontend-gtk
+			add_package live ubiquity-slideshow-xubuntu
+			;;
+		ubuntu-mate)
+			add_package live oem-config-gtk ubiquity-frontend-gtk
+			add_package live ubiquity-slideshow-ubuntu-mate
+			;;
+		ubuntu-server)
+			add_package live oem-config-debconf ubiquity-frontend-debconf
+			;;
+		ubuntu-base|ubuntu-oci|ubuntu-cpc|ubuntu-wsl)
+			;;
+		ubuntu)
+			add_package live oem-config-gtk ubiquity-frontend-gtk
+			add_package live ubiquity-slideshow-ubuntu
+			if [ "$SUBPROJECT" = "desktop-preinstalled" ]; then
+				add_package live language-pack-en-base oem-config-slideshow-ubuntu
+			fi
+			;;
+		*)
+			add_package live oem-config-gtk ubiquity-frontend-gtk
+			add_package live ubiquity-slideshow-ubuntu
+			;;
+	esac
+fi
+
+case $BINARYFORMAT in
+	iso*|usb*)
+		BINARY_IMAGES="$BINARYFORMAT"
+		MEMTEST=memtest86+
+		BOOTLOADER=syslinux
+		OPTS="${OPTS:+$OPTS }--zsync=false"
+		;;
+esac
+
+if [ "${SUBPROJECT:-}" = minimized ]; then
+	OPTS="${OPTS:+$OPTS }--bootstrap-flavour=minimal --linux-packages=linux-image"
+fi
+
+mkdir -p config/germinate-output
+case $PROJECT in
+        kubuntu-active*)
+                SEED=kubuntu-active.$SUITE
+                ;;
+        kubuntu*)
+                SEED=kubuntu.$SUITE
+                ;;
+        xubuntu*)
+                SEED=xubuntu.$SUITE
+                ;;
+        ubuntu-mate*)
+                SEED=ubuntu-mate.$SUITE
+                ;;
+        lubuntu*)
+                SEED=lubuntu.$SUITE
+                ;;
+        ubuntu-budgie*)
+                SEED=ubuntu-budgie.$SUITE
+                ;;
+        ubuntukylin*)
+                SEED=ubuntukylin.$SUITE
+                ;;
+        ubuntustudio*)
+                SEED=ubuntustudio.$SUITE
+                ;;
+        *)
+                SEED=ubuntu.$SUITE
+                ;;
+esac
+
+if ! [ -e config/germinate-output/structure ]; then
+        echo "Running germinate..."
+        (cd config/germinate-output && germinate --no-rdepends --no-installer \
+                -S $SEEDMIRROR -m $MIRROR -d $SUITE -s $SEED \
+                ${COMPONENTS:+-c "$COMPONENTS"} -a $ARCH)
+fi
+
+case $PROJECT in
+	ubuntu|ubuntu-dvd)
+
+		case ${SUBPROJECT:-} in
+			canary)
+				touch config/universe-enabled
+				PASSES_TO_LAYERS="true"
+				KERNEL_FLAVOURS='generic-hwe-22.04'
+				add_task minimal minimal standard ubuntu-desktop-minimal ubuntu-desktop-minimal-default-languages
+				add_task minimal.standard ubuntu-desktop ubuntu-desktop-default-languages
+				add_task minimal.standard.live ubuntu-live
+				add_package minimal cloud-init
+				remove_package minimal.standard.live ubiquity-frontend-gtk
+				add_snap minimal.standard.live ubuntu-desktop-installer/classic
+
+				seeded_langs="$(get_seeded_languages desktop-minimal desktop)"
+				echo "$seeded_langs" | tr ' ' ',' > config/seeded-languages
+				derive_language_layers minimal desktop-minimal desktop-minimal-default-languages "$seeded_langs"
+				derive_language_layers minimal.standard desktop desktop-default-languages "$seeded_langs"
+				cat <<-EOF > config/minimal.catalog-in.yaml
+					name: "Ubuntu Desktop (minimized)"
+					description: >-
+					  A minimal but usable Ubuntu Desktop.
+					id: ubuntu-desktop-minimal
+					type: fsimage-layered
+					variant: desktop
+					locale_support: langpack
+				EOF
+				cat <<-EOF > config/minimal.standard.catalog-in.yaml
+					name: "Ubuntu Desktop"
+					description: >-
+					  A full featured Ubuntu Desktop.
+					id: ubuntu-desktop
+					type: fsimage-layered
+					variant: desktop
+					locale_support: langpack
+					default: yes
+				EOF
+				/usr/share/livecd-rootfs/checkout-translations-branch \
+					https://git.launchpad.net/subiquity po config/catalog-translations
+				;;
+
+			desktop-preinstalled)
+				add_task install minimal standard ubuntu-desktop
+				case $SUBARCH in
+					raspi)
+						add_task install ubuntu-desktop-raspi
+						# XXX: Are those actually needed? I see we use those for ubuntu-cpc, which is the project
+						#  for existing raspi preinstalled images
+						# XXX: I would prefer to use --hdd-label=desktop-rootfs like 040-hyperv-desktop-images.binary
+						OPTS="${OPTS:+$OPTS }--initramfs=none"
+						OPTS="${OPTS:+$OPTS }--system=normal"
+						OPTS="${OPTS:+$OPTS }--hdd-label=cloudimg-rootfs"
+						OPTS="${OPTS:+$OPTS }--ext-resize-blocks=536870912 --ext-block-size=4096"
+						OPTS="${OPTS:+$OPTS }--ext-fudge-factor=15"
+						;;
+					intel-iot)
+						KERNEL_FLAVOURS='intel-iotg'
+						COMPONENTS='main restricted'
+						OPTS="${OPTS:+$OPTS }--initramfs=none"
+						OPTS="${OPTS:+$OPTS }--system=normal"
+						OPTS="${OPTS:+$OPTS }--hdd-label=cloudimg-rootfs"
+						OPTS="${OPTS:+$OPTS }--ext-resize-blocks=536870912 --ext-block-size=4096"
+						OPTS="${OPTS:+$OPTS }--ext-fudge-factor=15"
+						;;
+					*)
+						## Otherwise HYPERV image options.... *crickets* see the hyperv hook
+						;;
+				esac
+				;;
+			*)
+				LIVE_TASK='ubuntu-live'
+				add_task install minimal standard ubuntu-desktop
+				add_task live ubuntu-desktop-minimal-default-languages ubuntu-desktop-default-languages
+				KERNEL_FLAVOURS='generic-hwe-22.04'
+				if [ "$SUBARCH" = "intel-iot" ]; then
+					KERNEL_FLAVOURS='intel-iotg'
+					COMPONENTS='main restricted'
+				fi
+				;;
+		esac
+		;;
+
+	kubuntu|kubuntu-dvd)
+		add_task install minimal standard
+		add_task install kubuntu-desktop
+		LIVE_TASK='kubuntu-live'
+		COMPONENTS='main restricted universe'
+		add_chroot_hook remove-gnome-icon-cache
+		KERNEL_FLAVOURS='generic-hwe-22.04'
+		;;
+
+	kubuntu-active)
+		add_task install minimal standard kubuntu-active
+		LIVE_TASK='kubuntu-active-live'
+		COMPONENTS='main restricted universe'
+		add_chroot_hook remove-gnome-icon-cache
+		;;
+
+	kubuntu-plasma5)
+		add_task install minimal standard
+		add_package install kubuntu-plasma5-desktop
+		# Technically cheating, but PPAs don't have tasks and the
+		# live seed doesn't have a corresponding metapackage.  We'll
+		# get away with this as long as kubuntu-desktop and
+		# kubuntu-plasma5-desktop don't grow too far apart.
+		LIVE_TASK='kubuntu-live'
+		COMPONENTS='main restricted universe'
+		add_chroot_hook remove-gnome-icon-cache
+		;;
+
+	edubuntu|edubuntu-dvd)
+		add_task install minimal standard ubuntu-desktop edubuntu-desktop-gnome
+		LIVE_TASK='edubuntu-live'
+		COMPONENTS='main restricted universe'
+		;;
+
+	xubuntu)
+		add_task install minimal standard xubuntu-desktop
+		add_package install xterm
+		LIVE_TASK='xubuntu-live'
+		COMPONENTS='main restricted universe multiverse'
+		case $ARCH in
+			amd64|i386)	KERNEL_FLAVOURS='generic-hwe-22.04' ;;
+		esac
+		;;
+
+	ubuntu-netbook)
+		add_task install minimal standard ubuntu-netbook
+		LIVE_TASK='netbook-live'
+		;;
+
+	mythbuntu)
+		add_task install minimal standard mythbuntu-desktop
+		LIVE_TASK='mythbuntu-live'
+		COMPONENTS='main restricted universe multiverse'
+		;;
+
+	lubuntu)
+		add_task install minimal standard lubuntu-desktop
+		LIVE_TASK='lubuntu-live'
+		COMPONENTS='main restricted universe multiverse'
+		case $ARCH in
+			amd64|i386)	KERNEL_FLAVOURS='generic-hwe-22.04' ;;
+		esac
+		;;
+
+	ubuntu-gnome)
+		add_task install minimal standard ubuntu-gnome-desktop
+		LIVE_TASK='ubuntu-gnome-live'
+		COMPONENTS='main restricted universe'
+		;;
+
+	ubuntu-budgie)
+		add_task install minimal standard ubuntu-budgie-desktop
+		LIVE_TASK='ubuntu-budgie-live'
+		COMPONENTS='main restricted universe'
+		KERNEL_FLAVOURS='generic-hwe-22.04'
+		;;
+
+	ubuntu-mate)
+		add_task install minimal standard ubuntu-mate-core ubuntu-mate-desktop
+		LIVE_TASK='ubuntu-mate-live'
+		COMPONENTS='main restricted universe multiverse'
+		KERNEL_FLAVOURS='generic-hwe-22.04'
+		;;
+
+	ubuntustudio-dvd)
+		add_task install minimal standard ubuntustudio-desktop ubuntustudio-audio ubuntustudio-graphics ubuntustudio-video ubuntustudio-photography
+		# To work around the fact that v4l2loopback-dkms is still pulled in (via tasks) even though no longer present in the seeds
+		# Fixes build failure (LP: #2079803)
+		# We need to do it in a very hacky way, as the package-list files contain shell lines to execute to extract the needed
+		# packages. So to filter out the unneeded packages we hack in a sed filter for the respective task.
+		sed -i '/ubuntustudio-video/s/$/ | sed "\/^v4l2loopback-\/d" /' config/package-lists/livecd-rootfs.list.chroot_install
+		COMPONENTS='main restricted universe multiverse'
+		case $ARCH in
+			amd64|i386)	KERNEL_FLAVOURS='lowlatency-hwe-22.04' ;;
+		esac
+		;;
+
+	ubuntukylin)
+		add_task install minimal standard ubuntukylin-desktop
+		add_package install ubuntukylin-default-settings
+		LIVE_TASK='ubuntukylin-live'
+		COMPONENTS='main restricted universe'
+		KERNEL_FLAVOURS='generic-hwe-22.04'
+		;;
+
+	ubuntu-server)
+		case ${SUBPROJECT:-} in
+			live)
+				OPTS="${OPTS:+$OPTS }--bootstrap-flavour=minimal"
+				PASSES_TO_LAYERS=true
+				add_task ubuntu-server-minimal server-minimal
+				add_package ubuntu-server-minimal lxd-installer
+				add_task ubuntu-server-minimal.ubuntu-server minimal standard server
+				# add_task really should do this itself but for now...
+				snap_from_seed server config/package-lists/livecd-rootfs.snaplist.chroot_ubuntu-server-minimal.ubuntu-server.full
+				add_package ubuntu-server-minimal.ubuntu-server cloud-init
+
+				add_package ubuntu-server-minimal.ubuntu-server.installer linux-firmware casper openssh-server
+				add_snap ubuntu-server-minimal.ubuntu-server.installer subiquity/classic
+				if [ $ARCH = s390x ]; then
+					add_package ubuntu-server-minimal.ubuntu-server.installer s390-tools-zkey
+				fi
+
+				# Live server ISOs for LTS point releases past .2 offer both
+				# the GA and HWE kernels (in separate layers) so this code is
+				# written generically to support both even though a lot of the
+				# time only one kernel is offered.
+
+				case "$ARCH+${SUBARCH:-}" in
+					amd64+intel-iot)
+						variants='intel'
+						;;
+					arm64+tegra)
+						variants='tegra'
+						;;
+					arm64+tegra-igx)
+						variants='tegra-igx'
+						;;
+					arm64+tegra-jetson)
+						variants='tegra-jetson'
+						;;
+					riscv64*)
+						# However, for RISC-V we only offer one kernel
+						variants='ga'
+						;;
+					arm64+largemem)
+						variants='ga-64k hwe-64k'
+						;;
+					*)
+						variants='ga hwe'
+						;;
+				esac
+
+				for variant in $variants; do
+					if [ "$variant" = "ga" ]; then
+						kernel_metapkg=linux-generic
+						flavor=generic
+					elif [ "$variant" = "hwe" ]; then
+						kernel_metapkg=linux-generic-hwe-$(lsb_release -sr)
+						flavor=generic-hwe
+					elif [ "$variant" = "ga-64k" ]; then
+						kernel_metapkg=linux-generic-64k
+						flavor=generic-64k
+					elif [ "$variant" = "hwe-64k" ]; then
+						kernel_metapkg=linux-generic-64k-hwe-$(lsb_release -sr)
+						flavor=generic-64k-hwe
+					elif [ "$variant" = "intel" ]; then
+						kernel_metapkg=linux-intel-iotg
+						flavor=intel-iotg
+					elif [ "$variant" = "tegra" ]; then
+						kernel_metapkg=linux-nvidia-tegra
+						flavor=nvidia-tegra
+					elif [ "$variant" = "tegra-igx" ]; then
+						kernel_metapkg=linux-nvidia-tegra-igx
+						flavor=nvidia-tegra-igx
+					elif [ "$variant" = "tegra-jetson" ]; then
+						kernel_metapkg=linux-nvidia-tegra-jetson
+						flavor=nvidia-tegra-jetson
+					else
+						echo "bogus variant: $variant"
+						exit 1
+					fi
+
+					add_package ubuntu-server-minimal.ubuntu-server.installer.$flavor $kernel_metapkg
+					LIVE_PASSES="${LIVE_PASSES:+$LIVE_PASSES }ubuntu-server-minimal.ubuntu-server.installer.$flavor"
+				done
+
+				/usr/share/livecd-rootfs/checkout-translations-branch \
+					https://git.launchpad.net/subiquity po config/catalog-translations
+				;;
+			*)
+				echo "unrecognized subproject for server: '$SUBPROJECT'"
+				exit 1
+				;;
+		esac
+		COMPONENTS='main'
+		PREINSTALL_POOL_SEEDS='server-ship'
+		;;
+
+	ubuntu-base)
+		OPTS="${OPTS:+$OPTS }--bootstrap-flavour=minimal"
+		;;
+
+	ubuntu-oci)
+		OPTS="${OPTS:+$OPTS }--bootstrap-flavour=minimal"
+		;;
+
+	ubuntu-wsl)
+		add_task install minimal standard ubuntu-wsl
+		OPTS="${OPTS:+$OPTS }--linux-packages=none --initramfs=none"
+		KERNEL_FLAVOURS=none
+		BINARY_REMOVE_LINUX=false
+		;;
+
+	ubuntu-cpc)
+		KERNEL_FLAVOURS=virtual
+		COMPONENTS='main universe'
+		add_package live fwts fwts-frontend dmidecode squashfs-tools snapd
+		if [ "${SUBPROJECT:-}" = minimized ]; then
+			add_task install cloud-image
+			add_package install sudo lxd-installer
+		else
+			add_task install minimal
+			add_package install ubuntu-minimal
+		        case $ARCH in
+				armhf|arm64|ppc64el|powerpc)
+					add_task install server
+					;;
+			esac
+		fi
+
+		BINARY_REMOVE_LINUX=false
+		OPTS="${OPTS:+$OPTS }--initramfs=none"
+		case "$ARCH+${SUBARCH:-}" in
+			*+raspi)
+				add_task install ubuntu-server-raspi
+				;;
+			armhf*)
+				KERNEL_FLAVOURS=generic-lpae
+				add_package install flash-kernel
+				;;
+			arm64*)
+				add_package install flash-kernel
+				if [ "${SUBARCH:-}" = "generic" ]; then
+					KERNEL_FLAVOURS=generic
+				fi
+				;;
+			amd64*)
+				if [ "${SUBARCH:-}" = "generic" ]; then
+					KERNEL_FLAVOURS=generic
+				elif [ "${SUBARCH:-}" = "intel-iot" ]; then
+					KERNEL_FLAVOURS=intel-iotg
+					COMPONENTS='main restricted'
+					OPTS="${OPTS:+$OPTS }--initramfs=none"
+				fi
+				;;
+			riscv64*)
+				if [ -n "$SUBARCH" ]; then
+					case "${SUBARCH:-}" in
+						nezha|licheerv)
+							KERNEL_FLAVOURS=allwinner
+							;;
+						visionfive)
+							KERNEL_FLAVOURS=starfive
+							;;
+						*)
+							KERNEL_FLAVOURS=generic
+							;;
+					esac
+				fi
+				;;
+		esac
+		OPTS="${OPTS:+$OPTS }--system=normal"
+		OPTS="${OPTS:+$OPTS }--hdd-label=cloudimg-rootfs"
+		OPTS="${OPTS:+$OPTS }--ext-resize-blocks=536870912 --ext-block-size=4096"
+		OPTS="${OPTS:+$OPTS }--ext-fudge-factor=15"
+		;;
+
+	*)
+		echo "unknown project $PROJECT" >&2
+		exit 2
+		;;
+esac
+
+case $SUBPROJECT in
+	buildd)
+		OPTS="${OPTS:+$OPTS }--archive-areas main"
+		COMPONENTS='main restricted universe multiverse'
+		OPTS="${OPTS:+$OPTS }--apt-recommends false"
+		OPTS="${OPTS:+$OPTS }--apt-secure false"
+		OPTS="${OPTS:+$OPTS }--parent-mirror-binary ${MIRROR}"
+		# XXX cjwatson 2018-04-27: We need to work out how to make
+		# this conditional so that we can do things like building
+		# buildd chroots with -updates.  This probably involves
+		# either extending the PROPOSED hack or fixing the strange
+		# way that SUITE is in fact a series; in either case it's
+		# likely to involve work both here and in launchpad-buildd.
+		OPTS="${OPTS:+$OPTS }--security false --volatile false"
+
+		add_package install adduser
+		add_package install pkgbinarymangler
+		add_package install ca-certificates
+		add_package install gpg
+		add_package install gpg-agent
+		add_package install fakeroot
+		add_package install build-essential
+		# Needed for LXD-based builds.
+		add_package install init
+		# Not strictly build-essential, but traditionally present
+		# and a variety of things fail without it.
+		add_package install tzdata
+
+		cp -af /usr/share/livecd-rootfs/live-build/make-lxd-metadata.py config/make-lxd-metadata
+		;;
+esac
+
+# we'll expand the base seed given here according to the STRUCTURE file, and
+# then look in all of the seeds found to see which snaps are seeded
+case $PROJECT:${SUBPROJECT:-} in
+	ubuntu:*|kubuntu*:*|lubuntu*:*|xubuntu*:*|ubuntu-mate*:*|ubuntustudio*:*|ubuntukylin*:*|ubuntu-budgie*:*)
+		BASE_SEED='desktop'
+		;;
+	ubuntu-wsl:*)
+		BASE_SEED='wsl'
+		;;
+	ubuntu-cpc:*)
+		BASE_SEED='server'
+		;;
+	ubuntu-server:live)
+		BASE_SEED='server'
+		;;
+esac
+
+if [ "$PASSES_TO_LAYERS" != "true" ] && [ -n "${BASE_SEED}" ]; then
+	snap_from_seed "${BASE_SEED}" config/seeded-snaps
+fi
+if [ "$PROJECT:${SUBPROJECT:-}" = ubuntu-cpc:minimized ]; then
+	# We install a lxc script that installs the snap when invoked. We don't
+	# want any other snaps to come in without due consideration, so fail the
+	# build if we see such a snap.
+	for snap in `cat config/seeded-snaps`; do
+		case $snap in
+			lxd | lxd=*)
+				;;
+			*)
+				echo "Unexpected seeded snap for ubuntu-cpc:minimized build: $snap"
+				exit 1
+				;;
+		esac
+	done
+
+	# Truncate but don't delete to a) prevent any snaps from being seeded,
+	# while at the same time b) triggering initialization of assertions.
+	truncate --size 0 config/seeded-snaps
+fi
+
+# grab a list of packags to remove for a "minimal" installation from the seed
+# mirror for this project
+if [ -n "${BASE_SEED}" ] && [ -n "${BASE_SEED}" ]; then
+	minimal_packages_url=${SEEDMIRROR}/${SEED}/${BASE_SEED}.minimal-remove
+	echo -n "Checking ${minimal_packages_url} for a minimal installation list... "
+	minimal_packages_remove=$(wget -q -O- ${minimal_packages_url} | sed -e '/\s*#.*$/d' -e '/^\s*$/d')
+	if [ -n "${minimal_packages_remove}" ]; then
+		echo "${minimal_packages_remove}" > config/manifest-minimal-remove
+		echo "$(echo ${minimal_packages_remove} | tr '\n' ' ')"
+	else
+		echo "failed to retrieve, not including."
+	fi
+fi
+
+export APT_OPTIONS
+
+if [ "$PREINSTALLED" != "true" ] && [ "$PASSES_TO_LAYERS" != "true" ] && [ "$LIVE_TASK" ]; then
+	add_task live "$LIVE_TASK"
+fi
+
+case $PROJECT in
+	ubuntu-dvd)
+		add_task install ubuntu-usb
+		add_task live ubuntu-usb-live
+		;;
+
+	*-dvd)
+		add_task live "$PROJECT-live"
+		;;
+esac
+
+case "$ARCH${SUBARCH:++$SUBARCH}" in
+	arm*+raspi)
+		# Common configuration for all Raspberry Pi image variants (server,
+		# desktop etc.)
+		KERNEL_FLAVOURS="$SUBARCH"
+		COMPONENTS='main restricted universe multiverse'
+		# Most Pi-specific package installation is handled via the seeds in the
+		# per-project/subproject cases above
+		add_package install linux-firmware-raspi2 pi-bluetooth u-boot-rpi u-boot-tools
+		BINARY_REMOVE_LINUX=false
+		;;
+	arm64+tegra|arm64+tegra-igx|arm64+tegra-jetson)
+		# Common configuration for all NVIDIA Tegra image variants
+		# (server, desktop etc.)
+		KERNEL_FLAVOURS="nvidia-$SUBARCH"
+		COMPONENTS='main restricted universe multiverse'
+		;;
+	riscv*+*)
+		# We'll add wpasupplicant to the seeds when we work on RISC-V seeds.
+		add_package install wpasupplicant
+		;;
+esac
+
+case $PROJECT:${SUBPROJECT:-} in
+	ubuntu-server:*|ubuntu-base:*|ubuntu-oci:*)
+		OPTS="${OPTS:+$OPTS }--linux-packages=none --initramfs=none"
+		KERNEL_FLAVOURS=none
+		BINARY_REMOVE_LINUX=false
+		;;
+esac
+
+add_chroot_hook update-apt-file-cache
+add_chroot_hook update-apt-xapian-index
+add_chroot_hook update-mlocate-database
+add_chroot_hook remove-dbus-machine-id
+add_chroot_hook remove-openssh-server-host-keys
+add_chroot_hook remove-udev-persistent-rules
+
+case $PROJECT in
+	# if any flavours want to strip .pyc files from their live images, add them here
+	_)
+		add_chroot_hook remove-python-py
+		;;
+	amd64)
+		KERNEL_FLAVOURS="${SUBARCH:-$KERNEL_FLAVOURS}"
+		case $SUBARCH in
+			intel-iot)
+				COMPONENTS='main restricted'
+				KERNEL_FLAVOURS='intel-iotg'
+				;;
+		esac
+		;;
+esac
+
+lb config noauto \
+	--mode ubuntu \
+	--distribution "$SUITE" \
+	--iso-preparer "livecd-rootfs" \
+	--bootstrap-keyring ubuntu-keyring \
+	--binary-images "$BINARY_IMAGES" \
+	--memtest "$MEMTEST" \
+	$SOURCE \
+	--build-with-chroot false \
+	${MIRROR:+--parent-mirror-bootstrap $MIRROR} \
+	${COMPONENTS:+--parent-archive-areas "$COMPONENTS"} \
+	--apt-source-archives false \
+	${KERNEL_FLAVOURS:+--linux-flavours "$KERNEL_FLAVOURS"} \
+	--initsystem none \
+	--bootloader "$BOOTLOADER" \
+	${INITRAMFS_COMPRESSION:+--initramfs-compression "$INITRAMFS_COMPRESSION"} \
+	--checksums none \
+	--cache false \
+	${BOOTAPPEND_LIVE:+--bootappend-live "$BOOTAPPEND_LIVE"} \
+	$OPTS \
+	"$@"
+
+PASSES=$(_sanitize_passes "$PASSES")
+LIVE_PASSES=${LIVE_PASSES:-$(_get_live_passes "$PASSES")}
+
+if [ -n "$PASSES" ] && [ -z "$LIVE_PASSES" ]; then
+	echo "W: Multi-layered mode is enabled, but we didn't find any live pass." \
+	     "Either set \$LIVE_PASSES or add a pass ending with '.live'."
+fi
+
+echo "LB_CHROOT_HOOKS=\"$CHROOT_HOOKS\"" >> config/chroot
+echo "SUBPROJECT=\"${SUBPROJECT:-}\"" >> config/chroot
+echo "LB_DISTRIBUTION=\"$SUITE\"" >> config/chroot
+echo "IMAGEFORMAT=\"$IMAGEFORMAT\"" >> config/chroot
+if [ -n "$PASSES" ]; then
+	echo "PASSES=\"$PASSES\"" >> config/common
+fi
+if [ -n "$NO_SQUASHFS_PASSES" ]; then
+    echo "NO_SQUASHFS_PASSES=\"$NO_SQUASHFS_PASSES\"" >> config/common
+fi
+if [ -n "$LIVE_PASSES" ]; then
+	echo "LIVE_PASSES=\"$LIVE_PASSES\"" >> config/common
+fi
+echo "LB_BINARY_HOOKS=\"$BINARY_HOOKS\"" >> config/binary
+echo "BUILDSTAMP=\"$NOW\"" >> config/binary
+echo "SUBPROJECT=\"${SUBPROJECT:-}\"" >> config/binary
+echo "LB_DISTRIBUTION=\"$SUITE\"" >> config/binary
+
+if [ "${IMAGE_HAS_HARDCODED_PASSWORD:-}" = "1" ]; then
+	echo IMAGE_HAS_HARDCODED_PASSWORD=1 >> config/binary
+	if [ -n "${IMAGE_TARGETS:-}" ]; then
+		echo "IMAGE_TARGETS=\"${IMAGE_TARGETS:-}\"" >> config/binary
+	fi
+fi
+
+case $PROJECT in
+  ubuntu-cpc|ubuntu-core|ubuntu-base|ubuntu-oci|ubuntu-wsl)
+    # ubuntu-cpc gets this added in 025-create-groups.chroot, and we do
+    # not want this group in projects that are effectively just chroots
+    ;;
+  *)
+    # We add the lxd group at image build time so that the default user
+    # created by the installer or cloud-init is added to it (cloud-init
+    # will create any group the user is configured to be added to, but as
+    # a normal group not a system group, see
+    # https://bugs.launchpad.net/cloud-images/+bug/1844498).
+    cat > config/hooks/100-add-lxd-group.chroot <<EOF
+#!/bin/bash
+
+echo "Adding lxd group..."
+addgroup --system --quiet lxd
+EOF
+    ;;
+esac
+
+case $ARCH+$SUBARCH in
+	armhf+raspi2|armhf+raspi|arm64+raspi)
+		cat > config/hooks/01-firmware-directory.chroot_early <<EOF
+#!/bin/sh -ex
+mkdir -p /boot/firmware
+EOF
+		cat > config/hooks/999-raspi2-fixes.chroot <<EOF
+#!/bin/sh -ex
+cat >> /etc/fstab << EOM
+LABEL=system-boot       /boot/firmware  vfat    defaults        0       1
+EOM
+
+cat > /boot/firmware/cmdline.txt << EOM
+net.ifnames=0 dwc_otg.lpm_enable=0 console=ttyAMA0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 elevator=deadline rootwait
+EOM
+
+cat > /boot/firmware/config.txt << EOM
+# For more options and information see 
+# http://www.raspberrypi.org/documentation/configuration/config-txt.md
+# Some settings may impact device functionality. See link above for details
+
+kernel=uboot.bin
+device_tree_address=0x02000000
+
+# enable i2c
+dtparam=i2c_arm=on
+dtparam=spi=on
+
+# uncomment if you get no picture on HDMI for a default "safe" mode
+#hdmi_safe=1
+
+# uncomment this if your display has a black border of unused pixels visible
+# and your display can output without overscan
+#disable_overscan=1
+
+# uncomment the following to adjust overscan. Use positive numbers if console
+# goes off screen, and negative if there is too much border
+#overscan_left=16
+#overscan_right=16
+#overscan_top=16
+#overscan_bottom=16
+
+# uncomment to force a console size. By default it will be display's size minus
+# overscan.
+#framebuffer_width=1280
+#framebuffer_height=720
+
+# uncomment if hdmi display is not detected and composite is being output
+#hdmi_force_hotplug=1
+
+# uncomment to force a specific HDMI mode (this will force VGA)
+#hdmi_group=1
+#hdmi_mode=1
+
+# uncomment to force a HDMI mode rather than DVI. This can make audio work in
+# DMT (computer monitor) modes
+#hdmi_drive=2
+
+# uncomment to increase signal to HDMI, if you have interference, blanking, or
+# no display
+#config_hdmi_boost=4
+
+# uncomment for composite PAL
+#sdtv_mode=2
+
+#uncomment to overclock the arm. 700 MHz is the default.
+#arm_freq=800
+
+EOM
+EOF
+		;;
+	*)
+		;;
+esac
+
+if [ $PROJECT = ubuntu-server ] && [ "${SUBPROJECT:-}" != live ]; then
+	cat > config/hooks/100-remove-fstab.chroot <<EOF
+#! /bin/sh
+rm -f /etc/fstab
+EOF
+fi
+
+if [ $PROJECT != ubuntu-cpc ]; then
+	cat > config/hooks/100-preserve-apt-prefs.chroot <<\EOF
+#! /bin/sh -ex
+
+# live-build "helpfully" removes /etc/apt/preferences.d/* so we put a
+# copy somewhere it won't touch it.
+
+if [ -n "$(ls -A /etc/apt/preferences.d)" ]; then
+    cp -a /etc/apt/preferences.d /etc/apt/preferences.d.save
+fi
+EOF
+fi
+
+if [ $PROJECT = ubuntukylin ]; then
+	cat > config/hooks/100-ubuntukylin.chroot <<EOF
+#! /bin/sh
+set -e
+HOOK=/usr/share/ubuntukylin-default-settings/hooks/chroot
+if [ -x \$HOOK ]; then
+	exec \$HOOK
+fi
+exit 0
+EOF
+fi
+
+if $BINARY_REMOVE_LINUX; then
+	cat > config/binary_rootfs/excludes << EOF
+boot/vmlinu?-*
+boot/initrd.img-*
+EOF
+fi
+
+if [ "$PROPOSED" ]; then
+	. config/bootstrap
+
+	cat > config/archives/proposed.list.chroot << EOF
+deb $LB_PARENT_MIRROR_BINARY_VOLATILE $SUITE-proposed $LB_PARENT_ARCHIVE_AREAS
+EOF
+	cp -a config/archives/proposed.list.chroot \
+	      config/archives/proposed.list.binary
+fi
+
+case $PROJECT:${SUBPROJECT:-} in
+	*-dvd:*)
+		. config/bootstrap
+
+		cat > config/archives/dvd.list.binary << EOF
+deb $LB_PARENT_MIRROR_BINARY $SUITE universe multiverse
+deb $LB_PARENT_MIRROR_BINARY_VOLATILE $SUITE-updates universe multiverse
+deb $LB_PARENT_MIRROR_BINARY_SECURITY $SUITE-security universe multiverse
+EOF
+		if [ "$PROPOSED" ]; then
+			cat >> config/archives/dvd.list.binary << EOF
+deb $LB_PARENT_MIRROR_BINARY_VOLATILE $SUITE-proposed universe multiverse
+EOF
+		fi
+		;;
+
+	ubuntu-cpc:*|ubuntu-server:live|ubuntu:desktop-preinstalled|ubuntu-wsl:*)
+		# Ensure that most things e.g. includes.chroot are copied as is
+		for entry in /usr/share/livecd-rootfs/live-build/${PROJECT}/*; do
+			case $entry in
+				*hooks*)
+					# But hooks are shared across the projects with symlinks
+					# dereference them
+					cp -afL $entry config/
+					;;
+				*)
+					# Most places want to preserve symlinks as is
+					cp -af $entry config/
+					;;
+			esac
+		done
+
+		if [ "$PROJECT" = "ubuntu-cpc" ]; then
+			case ${IMAGE_TARGETS:-} in
+				"")
+					config/hooks.d/make-hooks --hooks-dir config/hooks all
+					;;
+				*)
+					config/hooks.d/make-hooks --hooks-dir config/hooks \
+						"$IMAGE_TARGETS"
+					;;
+			esac
+		fi
+
+		if [ "$IMAGEFORMAT" = none ]; then
+			rm -f config/hooks/*.binary*
+		fi
+		;;
+esac
+
+case $SUBPROJECT in
+	buildd)
+		cp -af /usr/share/livecd-rootfs/live-build/buildd/* config/
+		;;
+esac
+
+if [ "$EXTRA_PPAS" ]; then
+	rm -f config/archives/extra-ppas.list.chroot \
+	      config/archives/extra-ppas.pref.chroot \
+	      config/archives/extra-ppas.key.chroot
+	gpg_tmpdir="$(mktemp -d)"
+	run_gpg () {
+		gpg --no-default-keyring --no-options --homedir "$gpg_tmpdir" \
+			--secret-keyring "$gpg_tmpdir/secring.gpg" \
+			--keyserver hkp://keyserver.ubuntu.com:80/ \
+			"$@"
+	}
+	for extra_ppa in $EXTRA_PPAS; do
+		extra_ppa_pin=''
+		extra_ppa_origin=''
+		case $extra_ppa in
+		    *:*)
+			extra_ppa_pin=${extra_ppa#*:}
+			extra_ppa=${extra_ppa%:*}
+			;;
+		esac
+		extra_ppa_fingerprint="$(/usr/share/livecd-rootfs/get-ppa-fingerprint "$extra_ppa")"
+
+		cat >> config/archives/extra-ppas.list.chroot <<EOF
+deb http://ppa.launchpad.net/$extra_ppa/ubuntu @DISTRIBUTION@ main
+deb-src http://ppa.launchpad.net/$extra_ppa/ubuntu @DISTRIBUTION@ main
+EOF
+
+		if [ -n "$extra_ppa_pin" ]; then
+		    extra_ppa_origin="LP-PPA-$(echo $extra_ppa | sed -e 's,/ppa$,,' -e 's,/,-,')"
+		    echo "Package: *" >> config/archives/extra-ppas.pref.chroot
+		    echo "Pin: release o=$extra_ppa_origin" >> config/archives/extra-ppas.pref.chroot
+		    echo "Pin-Priority: $extra_ppa_pin" >> config/archives/extra-ppas.pref.chroot
+		    echo "" >> config/archives/extra-ppas.pref.chroot
+		fi
+		run_gpg --keyring "$gpg_tmpdir/pubring.gpg" \
+			--recv "$extra_ppa_fingerprint"
+		run_gpg --keyring "$gpg_tmpdir/pubring.gpg" \
+			--output "$gpg_tmpdir/export.gpg" \
+			--export "$extra_ppa_fingerprint"
+		got_fingerprint="$(
+			run_gpg --keyring "$gpg_tmpdir/export.gpg" \
+				--fingerprint --batch --with-colons |
+			grep '^fpr:' | cut -d: -f10)"
+		if [ "$got_fingerprint" != "$extra_ppa_fingerprint" ]; then
+			echo "Fingerprints do not match.  Got:" >&2
+			echo "$got_fingerprint" | sed 's/^/  /' >&2
+			echo "Expected:" >&2
+			echo "  $extra_ppa_fingerprint" >&2
+			exit 1
+		fi
+		cat "$gpg_tmpdir/export.gpg" >> config/archives/extra-ppas.key.chroot
+		rm -f "$gpg_tmpdir/export.gpg"
+	done
+	rm -rf "$gpg_tmpdir"
+	cp -a config/archives/extra-ppas.list.chroot \
+	      config/archives/extra-ppas.list.binary
+	cp -a config/archives/extra-ppas.key.chroot \
+	      config/archives/extra-ppas.key.binary
+	if [ -f config/archives/extra-ppas.pref.chroot ]; then
+		cp -a config/archives/extra-ppas.pref.chroot \
+		      config/archives/extra-ppas.pref.binary
+	fi
+fi
+
+if [ "$PREINSTALLED" = "true" ]; then
+	if [ -n "$PREINSTALL_POOL_SEEDS" ]; then
+		UNWANTED_SEEDS="${LIVE_TASK:+$LIVE_TASK }boot installer required"
+		for i in $UNWANTED_SEEDS; do
+			UNWANTED_SEEDS="${UNWANTED_SEEDS:+$UNWANTED_SEEDS }$(inheritance $i)"
+		done
+
+		for i in $PREINSTALL_POOL_SEEDS; do
+			PREINSTALL_POOL_SEEDS="${PREINSTALL_POOL_SEEDS:+$PREINSTALL_POOL_SEEDS }$(inheritance $i)"
+		done
+
+		for i in $PREINSTALL_POOL_SEEDS; do
+			case " $UNWANTED_SEEDS " in
+				*" $i "*)
+					;;
+				*)
+					PPS_EXP="${PPS_EXP:+$PPS_EXP }$i"
+					;;
+			esac
+		done
+
+		for i in $PPS_EXP; do
+			PREINSTALL_POOL="$PREINSTALL_POOL $(awk '{print $1}' \
+			config/germinate-output/$i | egrep -v '^-|^Package|^\|' | tr '\n' ' ')"
+		done
+	fi
+	if [ -n "$PREINSTALL_POOL" ]; then
+		mkdir -p config/gnupg
+		mkdir -p config/indices
+		for component in $COMPONENTS; do
+			(cd config/indices && \
+		 	 wget $MIRROR/indices/override.$SUITE.$component && \
+			 wget $MIRROR/indices/override.$SUITE.extra.$component \
+			)
+		done
+		cat > config/hooks/100-preinstall-pool.chroot <<EOF
+#! /bin/sh
+mkdir -p /var/lib/preinstalled-pool/pool/
+cd /var/lib/preinstalled-pool/pool/
+apt-get -y download $PREINSTALL_POOL
+EOF
+	fi
+fi

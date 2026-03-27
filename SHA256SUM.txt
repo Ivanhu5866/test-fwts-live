@@ -1,0 +1,2 @@
+# SHA256 checksums for fwts-live images
+# Format: <sha256>  <filename>
