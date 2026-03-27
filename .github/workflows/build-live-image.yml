@@ -33,7 +33,7 @@ jobs:
         run: docker run --privileged --rm -v "$GITHUB_WORKSPACE:/image" fwts-live
 
       - name: Verify output
-        run: test -f pc.img.xz || (echo "Build failed: pc.img.xz not found" && exit 1)
+        run: test -f pc.img.xz || (echo "Build failed - pc.img.xz not found" && exit 1)
 
       - name: Rename output
         run: mv pc.img.xz "${{ env.IMAGE_NAME }}"
